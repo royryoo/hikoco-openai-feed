@@ -1,14 +1,40 @@
-name: Test Shopify Locations
+name: Update HIKOCO OpenAI Feed
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 17 * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: hikoco-product-feed
+  cancel-in-progress: false
 
 jobs:
-  test:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
-      - name: Get Shopify Locations
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate Shopify product feed
         env:
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
@@ -17,82 +43,236 @@ jobs:
           python3 - <<'PY'
           import os
           import json
+          import gzip
+          import time
+          import html
+          import re
           import requests
+          from urllib.parse import quote
 
-          # Shopify API credentials
-          store = os.environ["SHOPIFY_STORE"].strip()
-          client_id = os.environ["SHOPIFY_CLIENT_ID"]
-          client_secret = os.environ["SHOPIFY_CLIENT_SECRET"]
+          STORE = os.environ["SHOPIFY_STORE"].strip()
+          CLIENT_ID = os.environ["SHOPIFY_CLIENT_ID"]
+          CLIENT_SECRET = os.environ["SHOPIFY_CLIENT_SECRET"]
 
-          print("Connecting to Shopify...")
+          LOCATION_ID = "gid://shopify/Location/605847578"
+          API_VERSION = "2026-10"
 
-          # Get Shopify Access Token
-          response = requests.post(
-              f"https://{store}/admin/oauth/access_token",
+          session = requests.Session()
+
+          print("Authenticating with Shopify...")
+
+          response = session.post(
+              f"https://{STORE}/admin/oauth/access_token",
               data={
                   "grant_type": "client_credentials",
-                  "client_id": client_id,
-                  "client_secret": client_secret,
+                  "client_id": CLIENT_ID,
+                  "client_secret": CLIENT_SECRET,
               },
-              timeout=30,
+              timeout=60,
           )
-
           response.raise_for_status()
+
           token = response.json()["access_token"]
 
-          print("Shopify authentication successful!")
+          session.headers.update({
+              "X-Shopify-Access-Token": token,
+              "Content-Type": "application/json",
+          })
 
-          # Get all Shopify locations
+          def graphql(query, variables=None):
+              for attempt in range(5):
+                  response = session.post(
+                      f"https://{STORE}/admin/api/{API_VERSION}/graphql.json",
+                      json={
+                          "query": query,
+                          "variables": variables or {},
+                      },
+                      timeout=120,
+                  )
+
+                  if response.status_code == 429 or response.status_code >= 500:
+                      time.sleep(2 ** attempt)
+                      continue
+
+                  response.raise_for_status()
+                  data = response.json()
+
+                  if data.get("errors"):
+                      raise RuntimeError(json.dumps(data["errors"]))
+
+                  return data["data"]
+
+              raise RuntimeError("Shopify API request failed")
+
+          def clean_text(value):
+              value = re.sub(r"<[^>]+>", " ", value or "")
+              value = html.unescape(value)
+              return " ".join(value.split())
+
           query = """
-          {
-            locations(first: 100) {
+          query GetProducts($cursor: String) {
+            products(first: 50, after: $cursor) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
               nodes {
                 id
-                name
-                isActive
-                fulfillsOnlineOrders
+                title
+                descriptionHtml
+                handle
+                vendor
+                status
+                onlineStoreUrl
+                featuredImage {
+                  url
+                }
+                variants(first: 100) {
+                  pageInfo {
+                    hasNextPage
+                  }
+                  nodes {
+                    id
+                    title
+                    sku
+                    price
+                    inventoryPolicy
+                    inventoryItem {
+                      inventoryLevel(
+                        locationId: "gid://shopify/Location/605847578"
+                      ) {
+                        quantities(names: ["available"]) {
+                          name
+                          quantity
+                        }
+                      }
+                    }
+                    image {
+                      url
+                    }
+                  }
+                }
               }
             }
           }
           """
 
-          result = requests.post(
-              f"https://{store}/admin/api/2026-10/graphql.json",
-              headers={
-                  "X-Shopify-Access-Token": token,
-                  "Content-Type": "application/json",
-              },
-              json={"query": query},
-              timeout=30,
-          )
+          os.makedirs("public", exist_ok=True)
 
-          result.raise_for_status()
+          cursor = None
+          total_products = 0
+          total_variants = 0
+          skipped_products = 0
 
-          data = result.json()
+          with gzip.open(
+              "public/catalog.jsonl.gz",
+              "wt",
+              encoding="utf-8",
+          ) as feed:
 
-          if data.get("errors"):
-              raise RuntimeError(json.dumps(data["errors"]))
+              while True:
+                  data = graphql(query, {"cursor": cursor})
+                  connection = data["products"]
 
-          print("")
+                  for product in connection["nodes"]:
+                      total_products += 1
+
+                      if product["status"] != "ACTIVE":
+                          skipped_products += 1
+                          continue
+
+                      if not product["onlineStoreUrl"]:
+                          skipped_products += 1
+                          continue
+
+                      if product["variants"]["pageInfo"]["hasNextPage"]:
+                          raise RuntimeError(
+                              f"More than 100 variants: {product['id']}. "
+                              "Additional pagination is required."
+                          )
+
+                      for variant in product["variants"]["nodes"]:
+                          image = variant["image"] or product["featuredImage"]
+
+                          if not image:
+                              continue
+
+                          inventory_level = variant["inventoryItem"]["inventoryLevel"]
+
+                          available_quantity = 0
+
+                          if inventory_level:
+                              for quantity in inventory_level["quantities"]:
+                                  if quantity["name"] == "available":
+                                      available_quantity = quantity["quantity"]
+
+                          available = (
+                              available_quantity > 0
+                              or variant["inventoryPolicy"] == "CONTINUE"
+                          )
+
+                          variant_id = variant["id"].split("/")[-1]
+
+                          title = product["title"]
+
+                          if variant["title"] != "Default Title":
+                              title += " - " + variant["title"]
+
+                          product_url = product["onlineStoreUrl"]
+
+                          separator = "&" if "?" in product_url else "?"
+                          product_url += separator + "variant=" + quote(variant_id)
+
+                          record = {
+                              "item_id": variant["id"],
+                              "title": title,
+                              "description": clean_text(product["descriptionHtml"]),
+                              "url": product_url,
+                              "brand": product["vendor"] or "HIKOCO",
+                              "seller_name": "HIKOCO",
+                              "image_url": image["url"],
+                              "availability": (
+                                  "in_stock" if available else "out_of_stock"
+                              ),
+                              "price": f"{variant['price']} NZD",
+                          }
+
+                          feed.write(
+                              json.dumps(record, ensure_ascii=False) + "\n"
+                          )
+
+                          total_variants += 1
+
+                  print(
+                      f"Processed {total_products} products, "
+                      f"{total_variants} variants"
+                  )
+
+                  if not connection["pageInfo"]["hasNextPage"]:
+                      break
+
+                  cursor = connection["pageInfo"]["endCursor"]
+
+          if total_variants == 0:
+              raise RuntimeError("No products generated. Feed not deployed.")
+
           print("================================")
-          print("HIKOCO SHOPIFY LOCATIONS")
+          print("HIKOCO PRODUCT FEED COMPLETE")
           print("================================")
-
-          locations = data["data"]["locations"]["nodes"]
-
-          for location in locations:
-              print("")
-              print("Location:", location["name"])
-              print("Location ID:", location["id"])
-              print("Active:", location["isActive"])
-              print(
-                  "Fulfils Online Orders:",
-                  location["fulfillsOnlineOrders"]
-              )
-              print("--------------------------------")
-
-          print("")
-          print("Total Locations:", len(locations))
-          print("Location check completed!")
-
+          print("Products:", total_products)
+          print("Variants:", total_variants)
+          print("Skipped products:", skipped_products)
+          print("File: public/catalog.jsonl.gz")
           PY
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
