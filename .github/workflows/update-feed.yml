@@ -1,0 +1,72 @@
+name: Test Shopify Connection
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test Shopify API
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import requests
+
+          store = os.environ["SHOPIFY_STORE"].strip()
+          client_id = os.environ["SHOPIFY_CLIENT_ID"]
+          client_secret = os.environ["SHOPIFY_CLIENT_SECRET"]
+
+          # Shopify Admin API access token
+          response = requests.post(
+              f"https://{store}/admin/oauth/access_token",
+              data={
+                  "grant_type": "client_credentials",
+                  "client_id": client_id,
+                  "client_secret": client_secret,
+              },
+              timeout=30,
+          )
+          response.raise_for_status()
+
+          token = response.json()["access_token"]
+
+          # Test product access
+          query = """
+          {
+            products(first: 3) {
+              nodes {
+                id
+                title
+                vendor
+              }
+            }
+          }
+          """
+
+          result = requests.post(
+              f"https://{store}/admin/api/2026-10/graphql.json",
+              headers={
+                  "X-Shopify-Access-Token": token,
+                  "Content-Type": "application/json",
+              },
+              json={"query": query},
+              timeout=30,
+          )
+          result.raise_for_status()
+
+          data = result.json()
+
+          if data.get("errors"):
+              raise RuntimeError(data["errors"])
+
+          print("Shopify connection successful!")
+          print("Products:")
+          for product in data["data"]["products"]["nodes"]:
+              print("-", product["title"])
+          PY
