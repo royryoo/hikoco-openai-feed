@@ -1,4 +1,4 @@
-name: Test Shopify Connection
+name: Test Shopify Locations
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test Shopify API
+      - name: Get Shopify Locations
         env:
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
@@ -16,13 +16,17 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
+          import json
           import requests
 
+          # Shopify API credentials
           store = os.environ["SHOPIFY_STORE"].strip()
           client_id = os.environ["SHOPIFY_CLIENT_ID"]
           client_secret = os.environ["SHOPIFY_CLIENT_SECRET"]
 
-          # Shopify Admin API access token
+          print("Connecting to Shopify...")
+
+          # Get Shopify Access Token
           response = requests.post(
               f"https://{store}/admin/oauth/access_token",
               data={
@@ -32,18 +36,21 @@ jobs:
               },
               timeout=30,
           )
-          response.raise_for_status()
 
+          response.raise_for_status()
           token = response.json()["access_token"]
 
-          # Test product access
+          print("Shopify authentication successful!")
+
+          # Get all Shopify locations
           query = """
           {
-            products(first: 3) {
+            locations(first: 100) {
               nodes {
                 id
-                title
-                vendor
+                name
+                isActive
+                fulfillsOnlineOrders
               }
             }
           }
@@ -58,15 +65,34 @@ jobs:
               json={"query": query},
               timeout=30,
           )
+
           result.raise_for_status()
 
           data = result.json()
 
           if data.get("errors"):
-              raise RuntimeError(data["errors"])
+              raise RuntimeError(json.dumps(data["errors"]))
 
-          print("Shopify connection successful!")
-          print("Products:")
-          for product in data["data"]["products"]["nodes"]:
-              print("-", product["title"])
+          print("")
+          print("================================")
+          print("HIKOCO SHOPIFY LOCATIONS")
+          print("================================")
+
+          locations = data["data"]["locations"]["nodes"]
+
+          for location in locations:
+              print("")
+              print("Location:", location["name"])
+              print("Location ID:", location["id"])
+              print("Active:", location["isActive"])
+              print(
+                  "Fulfils Online Orders:",
+                  location["fulfillsOnlineOrders"]
+              )
+              print("--------------------------------")
+
+          print("")
+          print("Total Locations:", len(locations))
+          print("Location check completed!")
+
           PY
