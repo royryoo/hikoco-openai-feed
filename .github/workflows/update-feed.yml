@@ -37,17 +37,18 @@ jobs:
           token = response.json()["access_token"]
 
           # Test product access
-          query = """
-          {
-            products(first: 3) {
-              nodes {
-                id
-                title
-                vendor
-              }
-            }
-          }
-          """
+query = """
+{
+  locations(first: 50) {
+    nodes {
+      id
+      name
+      isActive
+      fulfillsOnlineOrders
+    }
+  }
+}
+"""
 
           result = requests.post(
               f"https://{store}/admin/api/2026-10/graphql.json",
@@ -65,8 +66,13 @@ jobs:
           if data.get("errors"):
               raise RuntimeError(data["errors"])
 
-          print("Shopify connection successful!")
-          print("Products:")
-          for product in data["data"]["products"]["nodes"]:
-              print("-", product["title"])
-          PY
+print("Shopify connection successful!")
+print("Locations:")
+
+for location in data["data"]["locations"]["nodes"]:
+    print(
+        location["name"],
+        location["id"],
+        "Active:", location["isActive"],
+        "Online:", location["fulfillsOnlineOrders"]
+    )
